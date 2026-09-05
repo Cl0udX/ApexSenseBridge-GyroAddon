@@ -1,0 +1,3 @@
+[submodule "vendor/ApexSenseBridge"]
+	path = vendor/ApexSenseBridge
+	url = https://github.com/ReynArts/ApexSenseBridge.git

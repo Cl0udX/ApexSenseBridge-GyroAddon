@@ -1,0 +1,151 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 99bf8d9..2015d72 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,6 +34,7 @@ add_library(asb_core STATIC
+     src/flydigi/Apex5Identity.cpp
+     src/flydigi/Apex5Protocol.cpp
+     src/flydigi/Apex5Device.cpp
++    src/motion/ApexMotionSource.cpp  # ApexSenseBridge-GyroAddon
+ )
+ target_include_directories(asb_core PUBLIC src)
+ 
+diff --git a/src/dualsense/DualSenseInput.cpp b/src/dualsense/DualSenseInput.cpp
+index 0c10763..6c3b6aa 100644
+--- a/src/dualsense/DualSenseInput.cpp
++++ b/src/dualsense/DualSenseInput.cpp
+@@ -23,6 +23,22 @@ std::array<std::uint8_t, 33> buildViiperInput(const DualSenseInputState& state)
+     input[16] = static_cast<std::uint8_t>(state.touch2Y & 0xFF);
+     input[17] = static_cast<std::uint8_t>(state.touch2Y >> 8);
+     input[18] = state.touch2Active ? 1 : 0;
++
++    // --- ApexSenseBridge-GyroAddon: motion plumbing (little-endian int16) ---
++    input[19] = static_cast<std::uint8_t>(state.gyroX & 0xFF);
++    input[20] = static_cast<std::uint8_t>(state.gyroX >> 8);
++    input[21] = static_cast<std::uint8_t>(state.gyroY & 0xFF);
++    input[22] = static_cast<std::uint8_t>(state.gyroY >> 8);
++    input[23] = static_cast<std::uint8_t>(state.gyroZ & 0xFF);
++    input[24] = static_cast<std::uint8_t>(state.gyroZ >> 8);
++    input[25] = static_cast<std::uint8_t>(state.accelX & 0xFF);
++    input[26] = static_cast<std::uint8_t>(state.accelX >> 8);
++    input[27] = static_cast<std::uint8_t>(state.accelY & 0xFF);
++    input[28] = static_cast<std::uint8_t>(state.accelY >> 8);
++    input[29] = static_cast<std::uint8_t>(state.accelZ & 0xFF);
++    input[30] = static_cast<std::uint8_t>(state.accelZ >> 8);
++    // --- end ApexSenseBridge-GyroAddon ---
++
+     input[31] = state.batteryPercent;
+     input[32] = state.chargeState;
+     return input;
+diff --git a/src/dualsense/DualSenseInput.h b/src/dualsense/DualSenseInput.h
+index a50994f..c75df25 100644
+--- a/src/dualsense/DualSenseInput.h
++++ b/src/dualsense/DualSenseInput.h
+@@ -41,6 +41,18 @@ struct DualSenseInputState {
+     std::uint8_t batteryPercent = 100;
+     std::uint8_t chargeState = 0;
+ 
++    // --- ApexSenseBridge-GyroAddon: motion plumbing ---
++    // Raw sensor units, same scale/sign convention as a real DualSense USB
++    // input report. Populated from the Apex 5 vendor HID channel once that
++    // protocol is reverse engineered; left at 0 (neutral) until then.
++    std::int16_t gyroX = 0;
++    std::int16_t gyroY = 0;
++    std::int16_t gyroZ = 0;
++    std::int16_t accelX = 0;
++    std::int16_t accelY = 0;
++    std::int16_t accelZ = 0;
++    // --- end ApexSenseBridge-GyroAddon ---
++
+     bool operator==(const DualSenseInputState&) const = default;
+ };
+ 
+diff --git a/src/motion/ApexMotionSource.cpp b/src/motion/ApexMotionSource.cpp
+new file mode 100644
+index 0000000..fc23aed
+--- /dev/null
++++ b/src/motion/ApexMotionSource.cpp
+@@ -0,0 +1,19 @@
++#include "motion/ApexMotionSource.h"
++
++namespace asb::motion {
++
++void applyApex5Motion(asb::dualsense::DualSenseInputState& state) noexcept {
++    // TODO(gyro-addon): replace with the decoded Apex 5 vendor HID read once
++    // the protocol capture is done. Left neutral (0) for now, which is safe:
++    // a real DualSense at rest reports ~0 rate-of-rotation on gyro and a
++    // gravity-only reading on accel, but 0/0/0 is an acceptable placeholder
++    // that games interpret as "controller held still".
++    state.gyroX = 0;
++    state.gyroY = 0;
++    state.gyroZ = 0;
++    state.accelX = 0;
++    state.accelY = 0;
++    state.accelZ = 0;
++}
++
++} // namespace asb::motion
+diff --git a/src/motion/ApexMotionSource.h b/src/motion/ApexMotionSource.h
+new file mode 100644
+index 0000000..77cf420
+--- /dev/null
++++ b/src/motion/ApexMotionSource.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++// ApexSenseBridge-GyroAddon
++//
++// Isolated hook point for Apex 5 motion (gyro/accel) data. Kept in its own
++// translation unit on purpose: everything else in this codebase is upstream
++// ReynArts/ApexSenseBridge code we track via git submodule + patches, and we
++// want future `sync-upstream` merges to touch as few upstream lines as
++// possible. Only WindowsPhysicalInputSource.cpp gets a 2-line patch (include
++// + one call); all the real reverse-engineered protocol logic lives here.
++//
++// STATUS: stub. The Apex 5's official Flydigi Space Station software can
++// clearly read motion data from the controller (confirmed: full DualSense
++// incl. gyro works when it forces DualSense mode for GTA5), but the wire
++// format is proprietary and not yet reverse engineered in this project.
++//
++// To fill this in:
++//   1. Capture raw USB/HID traffic between Flydigi Space Station and the
++//      physical Apex 5 while its DualSense+gyro mode is active (Wireshark +
++//      USBPcap, or an HID-level sniffer). Rotate the controller on isolated
++//      axes (X only, Y only, Z only) to identify which bytes move and how.
++//   2. Once decoded (report id, offset, scale, endianness, sign convention),
++//      implement the real read here instead of the neutral no-op below.
++//   3. No other file needs to change: WindowsPhysicalInputSource.cpp already
++//      calls applyApex5Motion() after every parsed report.
++
++#include "dualsense/DualSenseInput.h"
++
++namespace asb::motion {
++
++// Called once per parsed input report, right after the generic HID/XInput
++// fields are decoded. Must fill state.gyro{X,Y,Z} / state.accel{X,Y,Z} using
++// the same units/sign convention as a real DualSense USB input report (see
++// DualSenseInput.h). Currently a no-op: leaves whatever the caller already
++// set (defaults to neutral/0 from DualSenseInputState's in-class initializers).
++void applyApex5Motion(asb::dualsense::DualSenseInputState& state) noexcept;
++
++} // namespace asb::motion
+diff --git a/src/platform/windows/WindowsPhysicalInputSource.cpp b/src/platform/windows/WindowsPhysicalInputSource.cpp
+index 20d0272..fcc0211 100644
+--- a/src/platform/windows/WindowsPhysicalInputSource.cpp
++++ b/src/platform/windows/WindowsPhysicalInputSource.cpp
+@@ -13,6 +13,7 @@
+ #include "platform/HidTransport.h"
+ #include "platform/XInputGamepad.h"
+ #include "platform/XInputMapping.h"
++#include "motion/ApexMotionSource.h"  // ApexSenseBridge-GyroAddon
+ 
+ #include <algorithm>
+ #include <array>
+@@ -430,6 +431,7 @@ private:
+ 
+         mapXInputButtons(xinputButtons, decoded.l2, decoded.r2, decoded);
+         if (buttonPressed(11)) decoded.buttons |= dualsense::button::kPs;
++        asb::motion::applyApex5Motion(decoded);  // ApexSenseBridge-GyroAddon
+         state = decoded;
+         return true;
+     }
