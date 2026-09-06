@@ -1,0 +1,17 @@
+# CMake build output (scripts/build.sh builds into ./build)
+build/
+out/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Local captures/scratch that don't belong in version control
+*.pcapng
+*.pcap

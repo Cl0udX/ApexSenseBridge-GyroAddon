@@ -1,0 +1,311 @@
+diff --git a/src/motion/ApexMotionSource.cpp b/src/motion/ApexMotionSource.cpp
+index fc23aed..37a54c3 100644
+--- a/src/motion/ApexMotionSource.cpp
++++ b/src/motion/ApexMotionSource.cpp
+@@ -1,19 +1,207 @@
+ #include "motion/ApexMotionSource.h"
+ 
++#include "flydigi/Apex5Protocol.h"
++#include "platform/HidTransport.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <limits>
++#include <span>
++#include <string>
++#include <vector>
++
+ namespace asb::motion {
++namespace {
++
++// --- Protocol constants -----------------------------------------------
++//
++// Everything below (report framing, command 17, the report layout) is the
++// Apex 5's vendor HID protocol as reverse-engineered for this project and
++// independently confirmed against OpenFlydigi's flydigi/motion.py (see
++// ApexMotionSource.h and this repo's CONTEXT.md). Framing constants
++// (report id, magic bytes, report size) are reused as-is from upstream's
++// own flydigi::Apex5Protocol.h rather than redefined here.
++
++constexpr std::uint8_t kCmdEnableRaw = 17; // OpenFlydigi: CMD_ENABLE_RAW
++constexpr std::uint8_t kUnchangedFlag = 0xFF;
++constexpr std::uint8_t kMotionReportMarker = 0xEF;
++constexpr std::size_t kGyroOffset = 18;   // 3x int16 LE: X, Y, Z
++constexpr std::size_t kAccelOffset = 24;  // 3x int16 LE: X, Y, Z
++constexpr std::size_t kMinMotionReportLength = 30;
++
++// Apex 5 reports ~4096 raw units per g (measured: az rests near there with
++// the pad flat). A real DualSense's calibration implies ~10000 raw units
++// per g (hid-playstation/inputtino convention), so games built assuming
++// that scale need the accel values rescaled to match.
++constexpr double kApex5AccelUnitsPerG = 4096.0;
++constexpr double kDualSenseAccelUnitsPerG = 10000.0;
++constexpr double kAccelScale = kDualSenseAccelUnitsPerG / kApex5AccelUnitsPerG;
++
++constexpr auto kReopenBackoff = std::chrono::seconds(2);
++// Bounds a single drain in case the stream ever floods faster than we can
++// read it; the motion stream runs at roughly 1kHz, so this is generous.
++constexpr int kMaxReportsPerDrain = 256;
++
++struct MotionSample {
++    std::int16_t gyroX = 0;
++    std::int16_t gyroY = 0;
++    std::int16_t gyroZ = 0;
++    std::int16_t accelX = 0;
++    std::int16_t accelY = 0;
++    std::int16_t accelZ = 0;
++};
++
++std::int16_t readInt16LE(std::span<const std::uint8_t> data, std::size_t offset) noexcept {
++    return static_cast<std::int16_t>(
++        static_cast<std::uint16_t>(data[offset]) |
++        (static_cast<std::uint16_t>(data[offset + 1]) << 8));
++}
++
++std::int16_t scaleAccel(std::int16_t raw) noexcept {
++    const double scaled = static_cast<double>(raw) * kAccelScale;
++    const double clamped = std::clamp(
++        scaled,
++        static_cast<double>((std::numeric_limits<std::int16_t>::min)()),
++        static_cast<double>((std::numeric_limits<std::int16_t>::max)()));
++    return static_cast<std::int16_t>(clamped);
++}
++
++// Command 17 ("raw data transport"), per OpenFlydigi's flydigi/motion.py:
++// set_raw_data. Each flag is 1 (on), 0 (off) or 0xFF (leave alone). The
++// payload-length byte is hardcoded to 7 (cmd + len + 5 flags), not the
++// length of any variable payload, and the checksum is the 8-bit sum of
++// bytes [3, 10) -- matches Flydigi's own ByteExtension.Crc.
++std::array<std::uint8_t, flydigi::kReportSize> buildRawDataReport(
++    std::uint8_t controllerData, std::uint8_t raw, std::uint8_t keyboard,
++    std::uint8_t mouse, std::uint8_t thirdParty) noexcept {
++    std::array<std::uint8_t, flydigi::kReportSize> report{};
++    report[0] = flydigi::kReportIdOut;
++    report[1] = flydigi::kMagic0;
++    report[2] = flydigi::kMagic1;
++    report[3] = kCmdEnableRaw;
++    report[4] = 7;
++    report[5] = controllerData;
++    report[6] = raw;
++    report[7] = keyboard;
++    report[8] = mouse;
++    report[9] = thirdParty;
++    std::uint32_t checksum = 0;
++    for (std::size_t i = 3; i < 10; ++i) checksum += report[i];
++    report[10] = static_cast<std::uint8_t>(checksum & 0xFF);
++    return report;
++}
++
++bool decodeMotionReport(std::span<const std::uint8_t> report, MotionSample& out) noexcept {
++    if (report.size() < kMinMotionReportLength) return false;
++    if (report[0] != flydigi::kReportIdIn || report[3] != kMotionReportMarker) return false;
++    out.gyroX = readInt16LE(report, kGyroOffset + 0);
++    out.gyroY = readInt16LE(report, kGyroOffset + 2);
++    out.gyroZ = readInt16LE(report, kGyroOffset + 4);
++    out.accelX = scaleAccel(readInt16LE(report, kAccelOffset + 0));
++    out.accelY = scaleAccel(readInt16LE(report, kAccelOffset + 2));
++    out.accelZ = scaleAccel(readInt16LE(report, kAccelOffset + 4));
++    return true;
++}
++
++// Owns (at most) one open handle to the Apex 5's vendor HID interface and
++// the enable/disable lifecycle around it. A function-local static instance
++// (see `channel()` below) gives this exactly the RAII shape already used
++// elsewhere in this codebase for hardware cleanup guards (TriggerResetGuard,
++// RumbleResetGuard): the destructor runs at process exit and sends the
++// disable command, so this never leaves the pad stuck in raw-data mode --
++// unlike Flydigi Space Station, which has no such guard.
++class MotionChannel {
++public:
++    MotionChannel() { tryOpen(); }
++
++    ~MotionChannel() {
++        if (!transport_) return;
++        std::string ignored;
++        transport_->writeOutputReport(
++            buildRawDataReport(kUnchangedFlag, 0, kUnchangedFlag, kUnchangedFlag, kUnchangedFlag),
++            ignored);
++        platform::destroyHidTransport(transport_);
++    }
++
++    MotionChannel(const MotionChannel&) = delete;
++    MotionChannel& operator=(const MotionChannel&) = delete;
++
++    // Returns the most recently decoded sample, draining any newly arrived
++    // reports first. Never blocks. Returns a neutral (all-zero) sample
++    // until the vendor interface is found and the first real report
++    // arrives.
++    MotionSample current() {
++        maybeRetryOpen();
++        if (transport_) drainAvailableReports();
++        return lastSample_;
++    }
++
++private:
++    void tryOpen() {
++        std::string error;
++        const auto devices = platform::enumerateHidDevices(error);
++        for (const auto& info : devices) {
++            if (info.vendorId == flydigi::kVendorId &&
++                info.usagePage == flydigi::kVendorUsagePage &&
++                flydigi::isControllerProduct(info.productId)) {
++                transport_ = platform::createHidTransport(info, error);
++                break;
++            }
++        }
++        if (!transport_) {
++            nextRetryAt_ = std::chrono::steady_clock::now() + kReopenBackoff;
++            return;
++        }
++        buffer_.assign(
++            (std::max<std::size_t>)(flydigi::kReportSize, transport_->info().inputReportLength),
++            std::uint8_t{0});
++        std::string enableError;
++        transport_->writeOutputReport(
++            buildRawDataReport(1, 1, kUnchangedFlag, kUnchangedFlag, kUnchangedFlag),
++            enableError);
++    }
++
++    void maybeRetryOpen() {
++        if (transport_) return;
++        if (std::chrono::steady_clock::now() < nextRetryAt_) return;
++        tryOpen();
++    }
++
++    void drainAvailableReports() {
++        for (int i = 0; i < kMaxReportsPerDrain; ++i) {
++            std::size_t bytesRead = 0;
++            std::string error;
++            const auto status = transport_->readInputReport(
++                buffer_, std::chrono::milliseconds(0), bytesRead, error);
++            if (status != platform::HidReadStatus::Data) return;
++            decodeMotionReport(
++                std::span<const std::uint8_t>(buffer_.data(), bytesRead), lastSample_);
++        }
++    }
++
++    platform::HidTransport* transport_ = nullptr;
++    std::vector<std::uint8_t> buffer_;
++    MotionSample lastSample_{};
++    std::chrono::steady_clock::time_point nextRetryAt_{};
++};
++
++MotionChannel& channel() {
++    static MotionChannel instance;
++    return instance;
++}
++
++} // namespace
+ 
+ void applyApex5Motion(asb::dualsense::DualSenseInputState& state) noexcept {
+-    // TODO(gyro-addon): replace with the decoded Apex 5 vendor HID read once
+-    // the protocol capture is done. Left neutral (0) for now, which is safe:
+-    // a real DualSense at rest reports ~0 rate-of-rotation on gyro and a
+-    // gravity-only reading on accel, but 0/0/0 is an acceptable placeholder
+-    // that games interpret as "controller held still".
+-    state.gyroX = 0;
+-    state.gyroY = 0;
+-    state.gyroZ = 0;
+-    state.accelX = 0;
+-    state.accelY = 0;
+-    state.accelZ = 0;
++    const MotionSample sample = channel().current();
++    state.gyroX = sample.gyroX;
++    state.gyroY = sample.gyroY;
++    state.gyroZ = sample.gyroZ;
++    state.accelX = sample.accelX;
++    state.accelY = sample.accelY;
++    state.accelZ = sample.accelZ;
+ }
+ 
+ } // namespace asb::motion
+diff --git a/src/motion/ApexMotionSource.h b/src/motion/ApexMotionSource.h
+index 77cf420..3044083 100644
+--- a/src/motion/ApexMotionSource.h
++++ b/src/motion/ApexMotionSource.h
+@@ -6,33 +6,43 @@
+ // translation unit on purpose: everything else in this codebase is upstream
+ // ReynArts/ApexSenseBridge code we track via git submodule + patches, and we
+ // want future `sync-upstream` merges to touch as few upstream lines as
+-// possible. Only WindowsPhysicalInputSource.cpp gets a 2-line patch (include
+-// + one call); all the real reverse-engineered protocol logic lives here.
++// possible. Only WindowsPhysicalInputSource.cpp gets a small patch (include +
++// one call in the xinput-fallback backend); all the real protocol logic
++// lives here, using only public, unmodified upstream APIs
++// (platform/HidTransport.h, flydigi/Apex5Protocol.h).
+ //
+-// STATUS: stub. The Apex 5's official Flydigi Space Station software can
+-// clearly read motion data from the controller (confirmed: full DualSense
+-// incl. gyro works when it forces DualSense mode for GTA5), but the wire
+-// format is proprietary and not yet reverse engineered in this project.
+-//
+-// To fill this in:
+-//   1. Capture raw USB/HID traffic between Flydigi Space Station and the
+-//      physical Apex 5 while its DualSense+gyro mode is active (Wireshark +
+-//      USBPcap, or an HID-level sniffer). Rotate the controller on isolated
+-//      axes (X only, Y only, Z only) to identify which bytes move and how.
+-//   2. Once decoded (report id, offset, scale, endianness, sign convention),
+-//      implement the real read here instead of the neutral no-op below.
+-//   3. No other file needs to change: WindowsPhysicalInputSource.cpp already
+-//      calls applyApex5Motion() after every parsed report.
++// STATUS: implemented. Protocol reverse-engineered by USB/HID capture
++// (see this repo's CONTEXT.md for the full writeup) and cross-checked
++// against OpenFlydigi (https://github.com/mkaliaha/openflydigi, MIT,
++// already credited in vendor/ApexSenseBridge/THIRD_PARTY_NOTICES.md),
++// whose flydigi/motion.py independently documents the same command (17,
++// "raw data transport") and report layout (report id 0x04, marker byte
++// 0xEF, gyro at offset 18, accel at offset 24). ApexMotionSource.cpp opens
++// its own HID handle to the Apex 5's vendor interface (usage page 0xFFA0),
++// sends the enable command with `controller_data=1` (confirmed by testing
++// that this keeps XInput responsive at the same time -- Space Station's own
++// activation instead sends `controller_data=0`, which freezes XInput; see
++// CONTEXT.md), and decodes gyro/accel out of the continuous 0xEF stream.
++// Buttons/sticks/dpad/triggers keep coming from the existing xinput-fallback
++// backend unchanged -- no need to read them from the vendor report too.
+ 
+ #include "dualsense/DualSenseInput.h"
+ 
+ namespace asb::motion {
+ 
+ // Called once per parsed input report, right after the generic HID/XInput
+-// fields are decoded. Must fill state.gyro{X,Y,Z} / state.accel{X,Y,Z} using
+-// the same units/sign convention as a real DualSense USB input report (see
+-// DualSenseInput.h). Currently a no-op: leaves whatever the caller already
+-// set (defaults to neutral/0 from DualSenseInputState's in-class initializers).
++// fields are decoded. Fills state.gyro{X,Y,Z} / state.accel{X,Y,Z} using the
++// same units/sign convention as a real DualSense USB input report (see
++// DualSenseInput.h): accel is rescaled from the Apex 5's raw ~4096-per-g to
++// the ~10000-per-g a real DualSense reports. Gyro is passed through
++// unscaled (raw device units) -- there is no reference to calibrate
++// deg/s-per-LSB against, so this is the one value worth tuning by feel once
++// wired into a game.
++//
++// Safe to call even when the vendor HID interface can't be opened yet (e.g.
++// briefly during startup): leaves the fields at whatever the caller already
++// set (defaults to neutral/0) until the channel comes up, and retries
++// opening it periodically in the background.
+ void applyApex5Motion(asb::dualsense::DualSenseInputState& state) noexcept;
+ 
+ } // namespace asb::motion
+diff --git a/src/platform/windows/WindowsPhysicalInputSource.cpp b/src/platform/windows/WindowsPhysicalInputSource.cpp
+index fcc0211..a3fb30c 100644
+--- a/src/platform/windows/WindowsPhysicalInputSource.cpp
++++ b/src/platform/windows/WindowsPhysicalInputSource.cpp
+@@ -431,7 +431,6 @@ private:
+ 
+         mapXInputButtons(xinputButtons, decoded.l2, decoded.r2, decoded);
+         if (buttonPressed(11)) decoded.buttons |= dualsense::button::kPs;
+-        asb::motion::applyApex5Motion(decoded);  // ApexSenseBridge-GyroAddon
+         state = decoded;
+         return true;
+     }
+@@ -627,6 +626,7 @@ public:
+             }
+         }
+         if (!gamepad_->poll(state, error)) return PhysicalInputStatus::Disconnected;
++        asb::motion::applyApex5Motion(state);  // ApexSenseBridge-GyroAddon
+         ++stats_.reports;
+         return PhysicalInputStatus::State;
+     }
