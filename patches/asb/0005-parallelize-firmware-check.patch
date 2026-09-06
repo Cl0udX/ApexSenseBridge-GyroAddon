@@ -1,0 +1,80 @@
+diff --git a/src/cli/BridgeCommand.cpp b/src/cli/BridgeCommand.cpp
+index faf3c68..c328367 100644
+--- a/src/cli/BridgeCommand.cpp
++++ b/src/cli/BridgeCommand.cpp
+@@ -463,14 +463,27 @@ int commandBridgeTriggers(int argc, char** argv) {
+                        std::chrono::milliseconds(2000), audioProtectionError);
+         });
+ 
++    // ApexSenseBridge-GyroAddon: this check is purely diagnostic -- its result
++    // (virtualFirmware) only ever feeds the "firmware verified/obsolete"
++    // console line and the end-of-session stats dump below, nothing here
++    // gates correctness or which devices the game sees. It previously ran
++    // synchronously right here, in front of physical-controller isolation,
++    // even though the two are independent (disjoint HID paths/handles) --
++    // measured at ~422ms, it was the single largest contributor to how long a
++    // game had to wait before the virtual DualSense replaced the physical
++    // Xbox-mode controller. Kicking it off async and joining it only once we
++    // actually need virtualFirmware (well after isolation is active and the
++    // Playnite "Ready" signal has already gone out) removes it from that
++    // critical path entirely, the same way audioProtectionFuture above
++    // already avoids stalling on endpoint publication.
+     std::string firmwareError;
+-    const auto virtualFirmware = readNewVirtualDualSenseFirmware(
+-        preexistingDualSensePaths, std::chrono::milliseconds(1500), firmwareError);
+-    if (!virtualFirmware) {
+-        std::cerr << "Warning: virtual DualSense firmware verification failed: "
+-                  << firmwareError << '\n';
+-    }
+-    const auto firmwareCheckedAt = std::chrono::steady_clock::now();
++    const auto firmwareStartedAt = std::chrono::steady_clock::now();
++    auto firmwareFuture = std::async(
++        std::launch::async,
++        [&preexistingDualSensePaths, &firmwareError]() {
++            return readNewVirtualDualSenseFirmware(
++                preexistingDualSensePaths, std::chrono::milliseconds(1500), firmwareError);
++        });
+ 
+     using MonitorPtr = std::unique_ptr<asb::platform::HidTransport,
+                                        void (*)(asb::platform::HidTransport*)>;
+@@ -522,6 +535,17 @@ int commandBridgeTriggers(int argc, char** argv) {
+         }
+     }
+ 
++    // ApexSenseBridge-GyroAddon: the game-facing state (physical hidden,
++    // virtual DualSense live, Playnite told "Ready") is already fully
++    // established above without waiting on firmwareFuture -- only join it
++    // now, this late, since nothing before this point needed its result.
++    const auto virtualFirmware = firmwareFuture.get();
++    if (!virtualFirmware) {
++        std::cerr << "Warning: virtual DualSense firmware verification failed: "
++                  << firmwareError << '\n';
++    }
++    const auto firmwareCheckedAt = std::chrono::steady_clock::now();
++
+     const auto initializedAt = std::chrono::steady_clock::now();
+     const auto initializationMilliseconds =
+         std::chrono::duration_cast<std::chrono::milliseconds>(
+@@ -532,12 +556,20 @@ int commandBridgeTriggers(int argc, char** argv) {
+     const auto virtualInputInitializationMilliseconds =
+         std::chrono::duration_cast<std::chrono::milliseconds>(
+             virtualInputReadyAt - physicalInputReadyAt).count();
++    // ApexSenseBridge-GyroAddon: firmware and isolation now run concurrently
++    // (see firmwareFuture above) instead of strictly back-to-back, so their
++    // cost is no longer a simple subtractive chain of the same timeline.
++    // Each is measured against its own start point instead, so these two
++    // numbers reflect what each step actually cost on its own -- their sum
++    // can legitimately exceed the wall-clock time between virtualInputReadyAt
++    // and isolationReadyAt now, since that's the whole point of overlapping
++    // them.
+     const auto firmwareInitializationMilliseconds =
+         std::chrono::duration_cast<std::chrono::milliseconds>(
+-            firmwareCheckedAt - virtualInputReadyAt).count();
++            firmwareCheckedAt - firmwareStartedAt).count();
+     const auto isolationInitializationMilliseconds =
+         std::chrono::duration_cast<std::chrono::milliseconds>(
+-            isolationReadyAt - firmwareCheckedAt).count();
++            isolationReadyAt - virtualInputReadyAt).count();
+     const auto processUsageStarted = processUsageSnapshot();
+ 
+     std::cout << "APEX verified: " << device->identity()->describe() << '\n'

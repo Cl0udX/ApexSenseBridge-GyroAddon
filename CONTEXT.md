@@ -454,17 +454,131 @@ next to itself — read these first for any future issue, they're detailed.
    one-time manual delete from "Learned executables" — the fix only stops
    *new* bad entries from being created.
 
+## Item 3 revisited: "run as Administrator" didn't actually fix the race, and here's why
+
+Tested directly on real hardware (Tray running elevated, GTA V fully closed
+first, Tray left running ~6 minutes before launching the game fresh — the
+clean test case, confirmed via `Get-CimInstance Win32_Process` timestamps
+that this really was a fresh process launched well after the Tray started
+watching). Result: **still `Source: poll` in `tray_detection.log`, and the
+game still started in Xbox mode.**
+
+Root cause: `tray_crash.log` had **no new WMI failure for that session** —
+WMI genuinely was enabled this time (admin did fix the "Acceso denegado").
+But `ProcessMonitorService.cs` also runs a plain 250ms poll timer
+unconditionally (`pollTimer = new Timer(OnPollTick, null, 100, 250)`,
+constructor around line 52), and both mechanisms funnel into the same
+`CheckCandidateProcess`. `Win32_ProcessStartTrace` (the WMI event class used)
+is ETW-backed and its own delivery latency is not sub-250ms in practice, so
+the poll timer keeps winning the race to notice the new process even with
+WMI fully working. **"Run as Administrator" is not the fix it looked like —
+it doesn't move the needle on this specific latency problem.** (It may still
+be worth leaving enabled for its own sake, just don't expect it to change
+detection speed.)
+
+The dominant, actually-provable cost is the ~900ms-1s of genuine bridge
+*startup* work that happens **after** a candidate is detected — see the next
+section. That's the real lever, and unlike detection speed, it's provably
+reducible.
+
+## Startup-latency investigation and fix (2026-09-06, patch 0005)
+
+Ran a parallel investigation (4 agents, one per cost center) against the
+real measured breakdown (`initialization_physical_input_ms=334`,
+`initialization_virtual_input_ms=122`, `initialization_firmware_ms=422`,
+`initialization_isolation_ms=33`, in `vendor/ApexSenseBridge/src/cli/
+BridgeCommand.cpp`'s own end-of-session stats). Key findings, most
+important first:
+
+- **`firmware_ms=422` (the single biggest chunk) is 100% diagnostic, zero
+  correctness impact.** Confirmed by grepping every consumer of
+  `virtualFirmware`/`DualSenseFirmwareInfo` in the whole codebase: only two,
+  both just `std::cout` lines ("firmware verified/obsolete" banner, and an
+  end-of-session stats dump). Nothing branches on it. It was blocking
+  `physicalIsolation.activate()` (the step that actually flips HidHide and
+  determines what the game sees) for no reason — the two are fully
+  independent (disjoint HID paths/handles).
+- `virtual_input_ms=122` is mostly a **measurement artifact**: the actual
+  libVIIPER device-creation call is ~7ms (matches the separately-logged
+  `backend_initialization_*_us` counters, which sum to ~6.7ms); the rest of
+  that bucket is `snapshotDualSensePaths()` (a full HID re-enumeration) and
+  `audioProtection.capture()` folded in by where the timestamps happen to
+  fall, not anything intrinsic to "creating the virtual DualSense."
+  Not touched by this patch — real but lower-value, left for later.
+- `isolation_ms=33` includes a **synchronous watchdog process spawn**
+  (`CreateProcessW`, fatal-on-failure) that's redundant with an
+  already-written `RunOnce` registry recovery marker. Real, but moot once
+  firmware runs in parallel — see below. Not touched by this patch.
+- Confirmed (with code citations, not just assumption) that the physical
+  controller **must never be permanently hidden** — `HidHide`'s
+  whitelist model blocks *every* non-whitelisted process/API path, so an
+  always-hidden physical controller would break unsupported games, Steam
+  Input, Windows Game Bar, and even Flydigi Space Station's own config UI.
+  The class is deliberately named `TemporaryPhysicalControllerIsolation`
+  with an RAII auto-restore destructor — this is a hard constraint, not
+  caution to relax.
+- The "keep everything pre-warmed" big redesign (persistent process owning
+  a continuously-open virtual DualSense, handed off per game session) is
+  technically *feasible* (proven safe to sit open+idle by the existing
+  `virtual-ds` diagnostic command) but needs a real feedback-handler rebind
+  API (currently bind-once at `open()`), splitting device-lifetime stats
+  from session-lifetime stats, and reworking the firmware "new device"
+  diffing to run once instead of per-launch — a genuine mini-redesign
+  touching many files, for a marginal gain **on top of** what the
+  parallelization fix below already captures. Decided against it for now,
+  consistent with keeping upstream-conflict risk low; revisit only if
+  the fix below still isn't enough to reliably beat a specific game.
+
+**Fix applied** (`patches/asb/0005-parallelize-firmware-check.patch`,
+`src/cli/BridgeCommand.cpp` only): `readNewVirtualDualSenseFirmware(...)` is
+now launched via `std::async` (mirroring the existing
+`audioProtectionFuture` pattern already in this same function) immediately
+after `audioProtectionFuture`, instead of blocking right there. Everything
+that used to wait for it — the `verifyVirtualInput` check,
+`physicalIsolation.activate()`, and the Playnite "Ready" signal — now runs
+without waiting on it at all. The future is only joined (`.get()`) well
+after "Ready" has already been signaled, right before the console summary
+needs `virtualFirmware`'s value. Net effect: **the entire ~422ms firmware
+wait, and by extension the ~33ms isolation step that used to sit strictly
+after it, are no longer on the critical path to "the game sees DualSense
+instead of Xbox" at all** — that path is now bounded by
+`physical_input_ms + virtual_input_ms + isolation_ms` alone (roughly
+334+122+33 ≈ 489ms of the original ~911ms), a reduction of very roughly
+**half**, achieved by reordering/overlapping already-independent existing
+work — no new processes, no IPC, no persistent state, same per-game-launch
+process model as always. Also had to fix the since-stale
+`firmwareInitializationMilliseconds`/`isolationInitializationMilliseconds`
+diagnostics math (they used to be a simple subtractive chain against
+`firmwareCheckedAt`, which now happens later than `isolationReadyAt` instead
+of earlier — each is now measured against its own start point instead, see
+the comment in the diff).
+
+Verified: compiles clean (0 warnings) from a full reset + all 5 patches
+reapplied in sequence via `apply-patches.sh`. **Not yet re-tested against a
+real GTA V race** — the user should re-run the same "close game, leave Tray
+running elevated a while, launch fresh" test and check whether it now starts
+in DualSense mode, and whether `tray_bridge.log`'s
+`initialization_firmware_ms`/`initialization_isolation_ms` numbers still
+make sense (they're independent measurements now, not a chain, so their sum
+can legitimately exceed the isolation-to-ready wall time).
+
 ## How to resume
 
 Paste this file into a new chat and say what you want to do next. Status as
 of 2026-09-06: gyro/accel + XInput coexistence is implemented, compiled, and
 confirmed working live; the Tray app builds and runs too, with two upstream
-bugs found and fixed along the way (see above), one actionable diagnosis not
-yet confirmed (item 3, run Tray as Administrator), and one hard game-side
-limitation understood and documented as not fixable (item 2). No need to
-re-explain the USBip/HidHide saga, the controller mode-switching issues from
-early on, or the protocol reverse-engineering — all resolved and documented
-above. Next open items, if any come up: tuning the gyro sign convention by
-feel in an actual game, whether running the Tray elevated actually helps
-detection speed in practice, and whichever other real-world testing the user
-reports back.
+Tray bugs found and fixed (title-match false positives, learned-cache
+persistence of low-confidence guesses); the "wins the game-launch race"
+problem was investigated in depth (WMI-vs-poll red herring debunked with
+real evidence, real ~1s startup-latency breakdown obtained, the single
+biggest lever — the diagnostic-only firmware check — parallelized in patch
+0005) but **not yet re-verified against real GTA V launches** after that
+fix. One hard game-side limitation (mid-session Xbox↔DualSense toggling)
+is understood and documented as genuinely not fixable, matching even
+Flydigi Space Station's own behavior. No need to re-explain the
+USBip/HidHide saga, the controller mode-switching issues from early on, the
+protocol reverse-engineering, or the WMI investigation — all resolved and
+documented above. Next open items: confirm patch 0005 actually helps in
+practice, tune the gyro sign convention by feel in an actual game, and decide
+whether the bigger "keep it warm" redesign is still worth it if 0005 alone
+isn't enough.
