@@ -1,0 +1,84 @@
+diff --git a/ApexSenseBridgeTray/Services/ProcessMonitorService.cs b/ApexSenseBridgeTray/Services/ProcessMonitorService.cs
+index ae608f9..ed39db0 100644
+--- a/ApexSenseBridgeTray/Services/ProcessMonitorService.cs
++++ b/ApexSenseBridgeTray/Services/ProcessMonitorService.cs
+@@ -338,13 +338,14 @@ namespace ApexSenseBridgeTray.Services
+ 
+             SupportedGame matchedGame;
+             string matchedBy;
+-            if (TryResolveGame(exePath, exeTitle, folderName, fileName, out matchedGame, out matchedBy))
++            bool isExactMatch;
++            if (TryResolveGame(exePath, exeTitle, folderName, fileName, out matchedGame, out matchedBy, out isExactMatch))
+             {
+                 if (GameActivationPolicy.ShouldActivate(
+                     matchedGame, settings, exeTitle, folderName, fileName))
+                 {
+                     HandleGameDetected(
+-                        matchedGame, pid, exePath, matchedBy, detectionStartedAt,
++                        matchedGame, pid, exePath, matchedBy, isExactMatch, detectionStartedAt,
+                         processEventUtc, detectionSource);
+                 }
+             }
+@@ -356,10 +357,15 @@ namespace ApexSenseBridgeTray.Services
+             string folderName,
+             string fileName,
+             out SupportedGame game,
+-            out string matchedBy)
++            out string matchedBy,
++            out bool isExactMatch)
+         {
+             game = null;
+             matchedBy = null;
++            // ApexSenseBridge-GyroAddon: whether this detection is confident enough to
++            // remember forever in the learned-executables cache (see HandleGameDetected).
++            // Defaults to true; only the fuzzy-scored fallback loop below sets it false.
++            isExactMatch = true;
+             if (gameListService == null) return false;
+ 
+             if (learningService != null &&
+@@ -390,11 +396,19 @@ namespace ApexSenseBridgeTray.Services
+                 }
+             }
+ 
++            // ApexSenseBridge-GyroAddon: this last loop is the fuzzy/scored fallback
++            // (CloudGameListService.TryFindGame -> GetMatchScore), the one responsible
++            // for matching e.g. a background process's product name against a game
++            // title by prefix/suffix rather than an exact identity. It's useful enough
++            // to activate the bridge for this session, but not confident enough to be
++            // memorized forever -- see the isExactMatch=false below and how
++            // HandleGameDetected uses it.
+             foreach (var candidate in candidates)
+             {
+                 if (gameListService.TryFindGame(candidate.Value, out game))
+                 {
+                     matchedBy = FormatMatchEvidence(candidate);
++                    isExactMatch = false;
+                     return true;
+                 }
+             }
+@@ -447,6 +461,7 @@ namespace ApexSenseBridgeTray.Services
+             uint pid,
+             string exePath,
+             string matchedBy,
++            bool isExactMatch,
+             long detectionStartedAt,
+             DateTime? processEventUtc,
+             string detectionSource)
+@@ -514,7 +529,16 @@ namespace ApexSenseBridgeTray.Services
+                     }
+                 }
+ 
+-                if (learningService != null)
++                // ApexSenseBridge-GyroAddon: only remember this executable forever
++                // when the match that found it was high-confidence (exact title/
++                // executable identity, not the fuzzy prefix/suffix fallback). A wrong
++                // fuzzy guess used to get memorized after one stable session and then
++                // silently reused for that executable from then on, with no way to
++                // notice besides a user manually opening "Learned executables" and
++                // deleting it. Low-confidence matches still activate the bridge for
++                // this session; they're just re-evaluated fresh next time instead of
++                // calcifying into a permanent (and possibly wrong) rule.
++                if (learningService != null && isExactMatch)
+                 {
+                     learningService.BeginObservation(
+                         pid,

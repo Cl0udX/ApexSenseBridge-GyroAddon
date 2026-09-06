@@ -408,16 +408,63 @@ next to itself — read these first for any future issue, they're detailed.
    *already running* still shows "Xbox" to that game, not "DualSense", until
    the game is restarted. Most games only enumerate controllers once at
    their own startup; HidHide swapping which device is visible mid-session
-   doesn't make an already-running game re-scan. Start the bridge (auto-detect
-   or forced) **before** launching the game, not after.
+   doesn't make an already-running game re-scan. Confirmed this is a game-side
+   limitation, not fixable here: even with two physical controllers connected,
+   the second one did nothing once the first was hidden mid-session either.
+   Even Flydigi Space Station's own official DualSense-forcing has the exact
+   same constraint (activates on game *launch*, never mid-session) — so this
+   is the expected, unavoidable workflow: **start the bridge (auto-detect or
+   forced) before launching the game, not after.**
+3. **Actionable, not yet applied**: `tray_crash.log` showed `WMI StartWatcher
+   unavailable: Acceso denegado`. `ProcessMonitorService.cs` prefers an
+   instant WMI process-start event (`Win32_ProcessStartTrace`, needs
+   Administrator) and falls back to slower polling when that's denied
+   (confirmed matching detections logged `Source: poll`, not `Source: WMI`).
+   Since some games scan for controllers within their first second alive,
+   losing time to polling meaningfully hurts the odds of the bridge being
+   ready before that scan happens. **Run `ApexSenseBridgeTray.exe` as
+   Administrator** to get the instant path — not guaranteed to win the race
+   for every game (bridge init still takes ~1s), but removes one real,
+   avoidable source of lag. Not yet confirmed whether the user tried this.
+4. **Fixed** (`patches/asb/0004-tray-learning-exact-only.patch`): found while
+   investigating why "Control" kept appearing detected by default — the
+   Tray's persistent "Learned executables" cache (`ExecutableLearningService`)
+   had an old entry mapping a third-party `XBOX360_Controller.exe` (an
+   unrelated tool the user has, at `C:\Users\Santiago\Documents\
+   XBOX360_Controller-2.8\`) to the game "Control", learned before patch 0003
+   existed (`"XBOX360_Controller"` normalizes to `"...controller"`, which
+   genuinely does start with `"control"`, so it still passes the 0003
+   boundary check — a real fuzzy match, just not the *right* game). Once
+   "learned" (stable for a while), a mapping is trusted forever with no
+   re-evaluation, so this one silently blocked all other detection via the
+   same "one active game at a time" policy as issue 1, and the only fix was
+   opening the Tray's own "Learned executables" screen and deleting the row
+   by hand.
+   Root cause fixed at the source: `TryResolveGame` in
+   `ProcessMonitorService.cs` now also returns whether the match was
+   high-confidence (exact title/executable identity) or the fuzzy
+   prefix/suffix fallback (`CloudGameListService.TryFindGame`), and
+   `HandleGameDetected` only calls `learningService.BeginObservation(...)`
+   (the entry point into the permanent cache) when it was exact. A fuzzy
+   match still activates the bridge for that session same as before — it
+   just never gets memorized, so a wrong guess can't outlive its own
+   session. Verified: still compiles clean, still passes the existing
+   80-assertion regression suite (no test exercises this specific gate, so
+   nothing to update there). The stale "Control" entry itself still needs a
+   one-time manual delete from "Learned executables" — the fix only stops
+   *new* bad entries from being created.
 
 ## How to resume
 
 Paste this file into a new chat and say what you want to do next. Status as
 of 2026-09-06: gyro/accel + XInput coexistence is implemented, compiled, and
-confirmed working live; the Tray app builds and runs too, with one upstream
-bug found and fixed along the way (see above). No need to re-explain the
-USBip/HidHide saga, the controller mode-switching issues from early on, or
-the protocol reverse-engineering — all resolved and documented above. Next
-open items, if any come up: tuning the gyro sign convention by feel in an
-actual game, and whichever real-world testing the user reports back.
+confirmed working live; the Tray app builds and runs too, with two upstream
+bugs found and fixed along the way (see above), one actionable diagnosis not
+yet confirmed (item 3, run Tray as Administrator), and one hard game-side
+limitation understood and documented as not fixable (item 2). No need to
+re-explain the USBip/HidHide saga, the controller mode-switching issues from
+early on, or the protocol reverse-engineering — all resolved and documented
+above. Next open items, if any come up: tuning the gyro sign convention by
+feel in an actual game, whether running the Tray elevated actually helps
+detection speed in practice, and whichever other real-world testing the user
+reports back.
