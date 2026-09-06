@@ -1,0 +1,36 @@
+diff --git a/ApexSenseBridgeTray/Services/CloudGameListService.cs b/ApexSenseBridgeTray/Services/CloudGameListService.cs
+index f0c83b4..3b9701a 100644
+--- a/ApexSenseBridgeTray/Services/CloudGameListService.cs
++++ b/ApexSenseBridgeTray/Services/CloudGameListService.cs
+@@ -203,14 +203,29 @@ namespace ApexSenseBridgeTray.Services
+         {
+             const int minimumFragmentLength = 6;
+ 
+-            if (gameName.Length >= minimumFragmentLength && candidate.Contains(gameName))
++            // ApexSenseBridge-GyroAddon: both strings arrive already normalized
++            // (Normalize() strips every non-alphanumeric character), so there is
++            // no punctuation/whitespace left to use as a word-boundary signal --
++            // a plain Contains() matches a short game title anywhere inside a
++            // longer name, embedded mid-word or not. That previously let e.g. a
++            // background "...ServiceController" process falsely match the game
++            // "Control", which then blocked real detection for whatever game
++            // was actually running (the activation policy treats one matched
++            // title as "already active" and ignores others). Requiring the
++            // fragment to land at the start or end of the candidate keeps
++            // legitimate matches (an exe like "control_dx12" or "thecontrol")
++            // while rejecting one buried in the middle of an unrelated name.
++            if (gameName.Length >= minimumFragmentLength &&
++                (candidate.StartsWith(gameName, StringComparison.Ordinal) ||
++                 candidate.EndsWith(gameName, StringComparison.Ordinal)))
+             {
+                 return 1000 + gameName.Length;
+             }
+ 
+             if (candidate.Length >= 8 &&
+                 candidate.Length * 2 >= gameName.Length &&
+-                gameName.Contains(candidate))
++                (gameName.StartsWith(candidate, StringComparison.Ordinal) ||
++                 gameName.EndsWith(candidate, StringComparison.Ordinal)))
+             {
+                 return 500 + candidate.Length;
+             }

@@ -323,10 +323,101 @@ So the full pipe already exists end to end: bytes 19-30 written by
 16-27. **The only remaining file to change for the whole feature is
 `src/motion/ApexMotionSource.cpp`** (steps 1-3 above).
 
+## Build/run status (2026-09-06): confirmed working end to end on real hardware
+
+The C++ toolchain is already installed on this machine (Visual Studio 2026
+Build Tools, `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools`)
+even though it's not on PATH — `vswhere.exe` finds it, `cl.exe`/bundled
+`cmake.exe` are under that tree. To build from a plain shell (not a
+Developer Prompt), call `vcvars64.bat` then the bundled cmake, e.g.:
+```
+call "...\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+"...\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -S vendor/ApexSenseBridge -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+"...\cmake.exe" --build build --target ApexSenseBridge
+```
+(`scripts/build.sh` does the same thing but needs `cmake`/`cl` already on
+PATH, i.e. a Developer Command Prompt — the above is the from-scratch
+version.) **Compiles clean, no errors, no warnings** — confirmed for
+`asb_core`, `ApexSenseBridge`, and `ApexSenseBridgeControl`.
+
+Confirmed live with a real Apex 5: buttons/sticks work via `xinput-fallback`
+exactly as before, and gyro/accel flow correctly at the same time — no
+XInput freeze, matching what the `controller_data=1` fix promised.
+
+### The Tray app (`ApexSenseBridgeTray`) — also in this same submodule, C#/WPF
+
+Automatic per-game detection (the "206+ supported games" feature) lives
+**entirely in the Tray app, not the CLI** — `ApexSenseBridge.exe
+bridge-triggers` never does game detection on its own, you always give it an
+explicit index. The Tray's source is right here too, just not C++:
+`vendor/ApexSenseBridge/ApexSenseBridgeTray/` (WPF, .NET Framework 4.6.2),
+built via `scripts/build-tray-app.ps1` (calls MSBuild, then runs
+`tests/ApexSenseBridgeTray.LearningTests.csproj` as a regression check).
+Confirmed `EngineSessionManager.cs` just shells out to `ApexSenseBridge.exe
+bridge-triggers ...` as a subprocess — **our patched CLI is a drop-in
+replacement, the Tray itself needed zero gyro-related changes**.
+
+Building it needs one extra component beyond the C++ workload: the **.NET
+Framework 4.6.2 targeting pack** (Visual Studio Installer → Modify →
+Individual Components → search ".NET Framework 4.6.2" — easy to
+mis-click "4.6" or "4.6.1" instead, they're listed right next to each
+other; the reference assemblies land at `C:\Program Files
+(x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.6.2\` when
+it's actually installed).
+
+`ApexSenseBridgeTray`'s own `InstallLocator.cs` looks for
+`ApexSenseBridge.exe`/`ApexSenseBridgeControl.exe` in (in order): the
+registry (`HKLM\Software\ApexSenseBridge`), `%ProgramFiles%\ApexSenseBridge`,
+**its own directory**, then sibling `build-win\Release`/`build-verify\Release`/
+`dist` folders relative to its own location. So the simplest way to run our
+patched build end-to-end: put `ApexSenseBridge.exe`,
+`ApexSenseBridgeControl.exe`, `ApexSenseBridgeTray.exe`, and (from the
+official Portable download, no need to build VIIPER from source)
+`viiper.exe` + `libVIIPER.dll`, all in one folder, and run the Tray from
+there. **Don't use `vendor/ApexSenseBridge/dist/` as that folder long-term**
+— `apply-patches.sh` runs `git clean -fd` on the submodule and will delete
+anything untracked living inside it, gyro build included. Copy the whole
+set somewhere outside the submodule instead (this session used
+`C:\Users\Santiago\Documents\ApexSenseBridge-GyroBuild\`).
+
+### Two issues found testing the Tray, both diagnosed from its own log files
+
+The Tray writes `tray_detection.log` / `tray_bridge.log` / `tray_crash.log`
+next to itself — read these first for any future issue, they're detailed.
+
+1. **Fixed** (`patches/asb/0003-tray-title-match-boundary-fix.patch`):
+   `CloudGameListService.cs::GetMatchScore` matched game titles as a plain
+   substring anywhere inside a candidate process name, with no word-boundary
+   check (both strings are pre-normalized by stripping all
+   non-alphanumeric characters, so no separators survive to check anyway).
+   Observed for real: a Visual Studio Code background process
+   (`...ServiceController.exe`) false-matched the game **"Control"**
+   (`"...servicecontroller".Contains("control")`), and the activation
+   policy then ignored every other real game detected afterward because it
+   believed "Control" was already the active session. Fix: require the
+   fragment to match at the **start or end** of the candidate/game string
+   (`StartsWith`/`EndsWith` instead of `Contains`), which rejects
+   mid-word matches like this one while keeping legitimate prefix/suffix
+   matches (verified with a standalone reflection-based harness against 6
+   cases — the bug case, a similar mid-word case, and 4 legitimate
+   prefix/suffix matches — all correct; also reran the existing 80-assertion
+   regression suite, still green). This is pure upstream Tray logic, unrelated
+   to gyro — patched anyway since the user asked, kept as its own patch file
+   for the same reason 0002 is separate from 0001.
+2. **Not a bug — expected behavior**: forcing the bridge on while a game is
+   *already running* still shows "Xbox" to that game, not "DualSense", until
+   the game is restarted. Most games only enumerate controllers once at
+   their own startup; HidHide swapping which device is visible mid-session
+   doesn't make an already-running game re-scan. Start the bridge (auto-detect
+   or forced) **before** launching the game, not after.
+
 ## How to resume
 
-Paste this file into a new chat and say what you want to do next — e.g.
-"I have a capture, help me decode it" or "let's check whether VIIPER already
-forwards bytes 19-30". No need to re-explain the USBip/HidHide saga or the
-controller mode-switching issues above; they're resolved and not relevant to
-the gyro work.
+Paste this file into a new chat and say what you want to do next. Status as
+of 2026-09-06: gyro/accel + XInput coexistence is implemented, compiled, and
+confirmed working live; the Tray app builds and runs too, with one upstream
+bug found and fixed along the way (see above). No need to re-explain the
+USBip/HidHide saga, the controller mode-switching issues from early on, or
+the protocol reverse-engineering — all resolved and documented above. Next
+open items, if any come up: tuning the gyro sign convention by feel in an
+actual game, and whichever real-world testing the user reports back.
